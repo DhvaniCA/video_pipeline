@@ -1,0 +1,97 @@
+# # Web Framework
+
+# fastapi==0.109.0
+# uvicorn[standard]==0.27.0
+# python-multipart==0.0.9
+
+# # AWS S3
+
+# boto3==1.34.34
+
+# # PDF Processing
+
+# PyPDF2==3.0.1
+# pdfplumber==0.10.3
+# reportlab==4.0.9
+# pillow==10.2.0
+
+# # LLM APIs
+
+
+# google-generativeai==0.3.2
+
+# # Database
+
+# pymongo==4.6.0
+
+# # Audio Generation (Text-to-Speech)
+
+# gtts==2.5.0
+# pydub==0.25.1
+
+# # Video Generation
+
+# moviepy==1.0.3
+# opencv-python==4.9.0.80
+
+# # 🔥 CRITICAL FIX (NumPy compatibility with OpenCV)
+
+# numpy==1.26.4
+
+# # Utilities
+
+# python-dotenv==1.0.1
+# requests==2.31.0
+# aiohttp==3.9.3
+# pydantic==2.6.1
+# openai>=1.40.0
+# httpx>=0.27.0
+
+# Web Framework
+
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.9
+
+# AWS S3
+
+boto3==1.34.34
+
+# PDF Processing
+
+PyPDF2==3.0.1
+pdfplumber==0.10.3
+reportlab==4.0.9
+pillow==10.2.0
+
+# LLM APIs
+
+
+google-generativeai==0.3.2
+
+# Database
+
+pymongo==4.6.0
+
+# Audio Generation (Text-to-Speech)
+
+gtts==2.5.0
+pydub==0.25.1
+
+# Video Generation
+
+moviepy==1.0.3
+opencv-python==4.9.0.80
+
+# 🔥 CRITICAL FIX (NumPy compatibility with OpenCV)
+
+numpy==1.26.4
+
+# Utilities
+
+python-dotenv==1.0.1
+requests==2.31.0
+aiohttp==3.9.3
+pydantic==2.6.1
+openai>=1.40.0
+httpx>=0.27.0

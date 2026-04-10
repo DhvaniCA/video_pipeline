@@ -1,0 +1,9 @@
+{
+  "name": "ca-content-processor",
+  "private": true,
+  "description": "CA Content Processor Backend - Python/FastAPI",
+  "scripts": {
+    "start": "echo 'This is a Python project. Run: python main.py'",
+    "test": "echo 'This is a Python project. Run: python test_api.py'"
+  }
+}
