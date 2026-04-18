@@ -115,7 +115,7 @@ Centralized configuration management loading from environment variables:
    ↓
 9. Upload simplified PDF to S3
    ↓
-10. Generate audio with gTTS
+10. Generate audio with elevan labs
    ↓
 11. Upload audio to S3
    ↓
