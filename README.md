@@ -134,7 +134,7 @@ Response:
 
 ### 4. Audio Generation
 - Converts simplified text to speech
-- Uses Google Text-to-Speech (gTTS)
+- Uses Google Text-to-Speech (eleven labs)
 - Creates MP3 audio file
 
 ### 5. Video Creation
