@@ -1,6 +1,6 @@
 import os
 import tempfile
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 
 from services.database import DatabaseService
@@ -23,18 +23,33 @@ class ContentProcessingOrchestrator:
     async def process(
         self,
         job_id: str,
-        pdf_url: str,
+        dashboard_id: Optional[str] = None,
+        pdf_url: str = None,
         use_gemini: bool = True,
         use_openai: bool = True
     ):
         """
         Main orchestration method that processes the entire pipeline.
+        
+        Args:
+            job_id: Unique job identifier (from processing_jobs)
+            dashboard_id: MongoDB _id from ca_dashboard collection (for storing results)
+            pdf_url: S3 URL of the PDF to process
+            use_gemini: Use Gemini LLM
+            use_openai: Use OpenAI LLM
         """
         temp_dir = None
 
         try:
             # Update status to processing
             self.db.update_job_status(job_id, "processing")
+            
+            # Update dashboard status to processing if dashboard_id provided
+            if dashboard_id:
+                self.db.update_dashboard_with_urls(
+                    dashboard_id,
+                    processing_status="processing"
+                )
 
             # Create temporary directory for processing
             temp_dir = tempfile.mkdtemp(prefix=f"ca_job_{job_id}_")
@@ -73,6 +88,14 @@ class ContentProcessingOrchestrator:
                 raise Exception("Failed to upload simplified PDF to S3")
 
             self.db.update_job(job_id, {"simplified_pdf_url": simplified_pdf_url})
+            
+            # Update dashboard with simplified PDF URL if dashboard_id provided
+            if dashboard_id:
+                self.db.update_dashboard_with_urls(
+                    dashboard_id,
+                    simplified_pdf_url=simplified_pdf_url,
+                    processing_status="processing"
+                )
 
             # Step 6: Generate video transcript FIRST
             print(f"[Job {job_id}] Generating video transcript...")
@@ -84,7 +107,7 @@ class ContentProcessingOrchestrator:
             # Step 7: Generate audio from the SAME transcript used in video
             print(f"[Job {job_id}] Generating audio from transcript...")
             audio_path = os.path.join(temp_dir, "audio.mp3")
-            self.audio.generate_audio_from_transcript(transcript, audio_path)
+            audio_path, seg_durations = self.audio.generate_audio_from_transcript(transcript, audio_path)
 
             # Step 8: Upload audio to S3
             print(f"[Job {job_id}] Uploading audio to S3...")
@@ -95,16 +118,24 @@ class ContentProcessingOrchestrator:
                 raise Exception("Failed to upload audio to S3")
 
             self.db.update_job(job_id, {"audio_url": audio_url})
+            
+            # Update dashboard with audio URL if dashboard_id provided
+            if dashboard_id:
+                self.db.update_dashboard_with_urls(
+                    dashboard_id,
+                    audio_url=audio_url,
+                    processing_status="processing"
+                )
 
             # Step 9: Create animated video
             print(f"[Job {job_id}] Creating animated video...")
             video_path = os.path.join(temp_dir, "video.mp4")
-            self.video.create_animated_video_from_transcript(
-                transcript,
-                video_path,
-                audio_path=audio_path
-            )
-
+            # self.video.create_animated_video_from_transcript(
+            #     transcript,
+            #     video_path,
+            #     audio_path=audio_path
+            # )
+            self.video.create_animated_video_from_transcript(transcript, video_path, audio_path, seg_durations)
             # Step 10: Upload video to S3
             print(f"[Job {job_id}] Uploading video to S3...")
             video_s3_key = self.s3.generate_s3_key(job_id, "video", "mp4")
@@ -124,12 +155,34 @@ class ContentProcessingOrchestrator:
                 }
             })
 
+            # Step 12: Update ca_dashboard document with all URLs if dashboard_id provided
+            if dashboard_id:
+                success = self.db.update_dashboard_with_urls(
+                    dashboard_id,
+                    simplified_pdf_url=simplified_pdf_url,
+                    audio_url=audio_url,
+                    video_url=video_url,
+                    processing_status="completed"
+                )
+                
+                if success:
+                    print(f"[Job {job_id}] ✓ Successfully updated ca_dashboard document {dashboard_id}")
+                else:
+                    print(f"[Job {job_id}] ✗ Failed to update ca_dashboard document {dashboard_id}")
+
             print(f"[Job {job_id}] Processing completed successfully!")
 
         except Exception as e:
             error_msg = str(e)
             print(f"[Job {job_id}] Error: {error_msg}")
             self.db.update_job_status(job_id, "failed", error=error_msg)
+            
+            # Update dashboard status to failed if dashboard_id provided
+            if dashboard_id:
+                self.db.update_dashboard_with_urls(
+                    dashboard_id,
+                    processing_status="failed"
+                )
 
         finally:
             # Clean up temporary files
