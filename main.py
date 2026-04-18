@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import Optional
 import uuid
 from datetime import datetime
+from bson.objectid import ObjectId
 
 from services.database import DatabaseService
 from services.orchestrator import ContentProcessingOrchestrator
@@ -12,7 +14,13 @@ app = FastAPI(
     description="Backend system for processing CA educational content with AI",
     version="1.0.0"
 )
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["http://localhost:5173"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 try:
     db_service = DatabaseService()
 except Exception as e:
@@ -22,16 +30,19 @@ except Exception as e:
 
 class ProcessingRequest(BaseModel):
     pdf_s3_url: HttpUrl
+    dashboard_id: str  # MongoDB _id from ca_dashboard collection
     use_gemini: bool = True
     use_openai: bool = True
 
 class ProcessingResponse(BaseModel):
     job_id: str
+    dashboard_id: str
     status: str
     message: str
 
 class JobStatusResponse(BaseModel):
     job_id: str
+    dashboard_id: str
     status: str
     original_pdf_url: Optional[str]
     simplified_pdf_url: Optional[str]
@@ -48,7 +59,8 @@ async def root():
         "version": "1.0.0",
         "endpoints": {
             "process": "/api/process",
-            "status": "/api/status/{job_id}"
+            "status": "/api/status/{job_id}",
+            "dashboard_status": "/api/dashboard/{dashboard_id}"
         }
     }
 
@@ -58,18 +70,37 @@ async def process_content(
     background_tasks: BackgroundTasks
 ):
     """
-    Start processing a PDF from S3 URL.
-    Returns a job_id for tracking progress.
+    Start processing a PDF from S3 URL and link to ca_dashboard document.
+    
+    Args:
+        request.pdf_s3_url: S3 URL of the original PDF
+        request.dashboard_id: MongoDB _id from ca_dashboard collection
+        request.use_gemini: Use Gemini LLM (default: True)
+        request.use_openai: Use OpenAI LLM (default: True)
+    
+    Returns:
+        job_id: Unique job ID for tracking
+        dashboard_id: The dashboard document being updated
+        status: Current job status (queued)
     """
     if not db_service:
         raise HTTPException(status_code=500, detail="Database service is not available. Check MongoDB connection.")
 
     try:
-        # Create a new job in database
+        # Validate dashboard_id exists in ca_dashboard collection
+        dashboard_doc = db_service.get_dashboard_document(request.dashboard_id)
+        if not dashboard_doc:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Dashboard document with ID {request.dashboard_id} not found"
+            )
+
+        # Create a new job in processing_jobs collection
         job_id = str(uuid.uuid4())
 
         job_data = {
             "job_id": job_id,
+            "dashboard_id": request.dashboard_id,  # Link to ca_dashboard
             "status": "queued",
             "original_pdf_url": str(request.pdf_s3_url),
             "use_gemini": request.use_gemini,
@@ -83,6 +114,7 @@ async def process_content(
         background_tasks.add_task(
             orchestrator.process,
             job_id=job_id,
+            dashboard_id=request.dashboard_id,
             pdf_url=str(request.pdf_s3_url),
             use_gemini=request.use_gemini,
             use_openai=request.use_openai
@@ -90,17 +122,20 @@ async def process_content(
 
         return ProcessingResponse(
             job_id=job_id,
+            dashboard_id=request.dashboard_id,
             status="queued",
             message="Processing started. Use the job_id to check status."
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start processing: {str(e)}")
 
 @app.get("/api/status/{job_id}", response_model=JobStatusResponse)
 async def get_job_status(job_id: str):
     """
-    Get the status of a processing job.
+    Get the status of a processing job by job_id.
     """
     if not db_service:
         raise HTTPException(status_code=500, detail="Database service is not available. Check MongoDB connection.")
@@ -113,20 +148,54 @@ async def get_job_status(job_id: str):
 
         return JobStatusResponse(
             job_id=job["job_id"],
+            dashboard_id=job.get("dashboard_id", ""),
             status=job["status"],
             original_pdf_url=job.get("original_pdf_url"),
             simplified_pdf_url=job.get("simplified_pdf_url"),
             audio_url=job.get("audio_url"),
             video_url=job.get("video_url"),
             error=job.get("error"),
-            created_at=str(job["created_at"]),   # convert datetime → string
-            updated_at=str(job["updated_at"])    # convert datetime → string
+            created_at=str(job["created_at"]),
+            updated_at=str(job["updated_at"])
         )
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get job status: {str(e)}")
+
+@app.get("/api/dashboard/{dashboard_id}")
+async def get_dashboard_status(dashboard_id: str):
+    """
+    Get the processing status and generated URLs from ca_dashboard document.
+    Shows: simplified_pdf_url, audio_url, video_url if available.
+    """
+    if not db_service:
+        raise HTTPException(status_code=500, detail="Database service is not available. Check MongoDB connection.")
+
+    try:
+        dashboard_doc = db_service.get_dashboard_document(dashboard_id)
+
+        if not dashboard_doc:
+            raise HTTPException(status_code=404, detail="Dashboard document not found")
+
+        return {
+            "dashboard_id": dashboard_id,
+            "title": dashboard_doc.get("title"),
+            "chapter": dashboard_doc.get("chapter"),
+            "original_pdf_url": dashboard_doc.get("pdf_url"),
+            "simplified_pdf_url": dashboard_doc.get("simplified_pdf_url"),
+            "audio_url": dashboard_doc.get("audio_url"),
+            "video_url": dashboard_doc.get("video_url"),
+            "processing_status": dashboard_doc.get("processing_status", "pending"),
+            "created_at": str(dashboard_doc.get("created_at")),
+            "updated_at": str(dashboard_doc.get("updated_at"))
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get dashboard status: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
