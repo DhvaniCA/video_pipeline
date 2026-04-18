@@ -3,7 +3,7 @@ from botocore.exceptions import ClientError
 from typing import Optional
 import os
 from config import config
-
+from urllib.parse import urlparse, unquote
 class S3Service:
     def __init__(self):
         self.s3_client = boto3.client(
@@ -25,7 +25,7 @@ class S3Service:
             from urllib.parse import urlparse
             parsed = urlparse(s3_url)
             # The path starts with '/', so strip the leading slash to get the key
-            key = parsed.path.lstrip('/')
+            key = unquote(parsed.path.lstrip('/'))   # ✅ FIX
 
             print(f"  Bucket: {self.bucket_name}")
             print(f"  Key: {key}")
