@@ -19,15 +19,15 @@ openai>=1.40.0
 # Database
 pymongo==4.6.0
 
-# Audio Generation — ElevenLabs (primary) + pydub for stitching
-elevenlabs>=1.2.0          # Indian accent voices; pip install elevenlabs
+# Audio Generation
+elevenlabs>=1.2.0
 pydub==0.25.1
 
 # Video Generation
 moviepy==1.0.3
-opencv-python==4.9.0.80
+opencv-python-headless==4.9.0.80
 
-# 🔥 CRITICAL — NumPy compatibility with OpenCV
+# NumPy compatibility
 numpy==1.26.4
 
 # Utilities
