@@ -10,7 +10,7 @@ boto3==1.34.34
 PyPDF2==3.0.1
 pdfplumber==0.10.3
 reportlab==4.0.9
-pillow==10.2.0
+Pillow==11.2.1
 
 # LLM APIs
 google-generativeai==0.3.2
