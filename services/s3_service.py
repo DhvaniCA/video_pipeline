@@ -12,7 +12,7 @@ class S3Service:
             aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
             region_name=config.AWS_REGION
         )
-        self.bucket_name = config.S3_BUCKET_NAME
+        self.bucket_name = config.AWS_S3_BUCKET
 
     def download_file(self, s3_url: str, local_path: str) -> bool:
         """Download a file from S3 URL to local path."""
