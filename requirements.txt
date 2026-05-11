@@ -10,7 +10,7 @@ boto3==1.34.34
 PyPDF2==3.0.1
 pdfplumber==0.10.3
 reportlab==4.0.9
-Pillow==11.2.1
+Pillow==10.4.0
 
 # LLM APIs
 google-generativeai==0.3.2
@@ -27,7 +27,7 @@ pydub==0.25.1
 moviepy==1.0.3
 opencv-python-headless==4.9.0.80
 
-# NumPy compatibility
+# NumPy
 numpy==1.26.4
 
 # Utilities
