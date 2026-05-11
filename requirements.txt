@@ -1,6 +1,6 @@
 # Web Framework
-fastapi==0.109.0
-uvicorn[standard]==0.27.0
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
 python-multipart==0.0.9
 
 # AWS S3
@@ -34,5 +34,6 @@ numpy==1.26.4
 python-dotenv==1.0.1
 requests==2.31.0
 aiohttp==3.9.3
-pydantic==2.6.1
+pydantic==2.8.2
+pydantic-settings==2.2.1
 httpx>=0.27.0
