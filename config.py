@@ -1,3 +1,41 @@
+# import os
+# from dotenv import load_dotenv
+
+# load_dotenv()
+
+# class Config:
+#     # AWS S3
+#     AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+#     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+#     AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+#     S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+
+#     # MongoDB
+#     MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+#     MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ca_content_processor")
+
+#     # OpenAI
+#     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+#     # Google Gemini
+#     GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+#     # TTS API (legacy / unused when Vapi is active)
+#     TTS_API_KEY = os.getenv("TTS_API_KEY")
+#     TTS_API_URL = os.getenv("TTS_API_URL")
+
+#     # Vapi TTS — Indian-accent neural voices
+#     # Male instructor : en-IN-PrabhatNeural
+#     # Female student  : en-IN-NeerjaNeural
+#     # Get your key at: https://dashboard.vapi.ai
+#     VAPI_API_KEY = os.getenv("VAPI_API_KEY")
+
+#     # Processing settings
+#     MAX_VIDEO_DURATION = 420  # 7 minutes in seconds
+#     TEMP_DIR = "/tmp/ca_content_processor"
+
+# config = Config()
+
 import os
 from dotenv import load_dotenv
 
@@ -8,12 +46,12 @@ class Config:
     AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
     AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
     AWS_REGION            = os.getenv("AWS_REGION", "us-east-1")
-    AWS_S3_BUCKET        = os.getenv("S3_BUCKET_NAME")
-
+    S3_BUCKET_NAME        = os.getenv("S3_BUCKET_NAME")
+    CS_S3_BUCKET_NAME     = os.getenv("CS_S3_BUCKET_NAME", "cs-chatbot-pdf-store")  # Optional override for CS platform
     # MongoDB
     MONGODB_URI     = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ca_content_processor")
-
+    MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "ca_chatbot")
+    CS_MONGODB_DB_NAME = os.getenv("CS_MONGODB_DB_NAME", "cs_chatbot")
     # OpenAI
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
