@@ -1,39 +1,53 @@
-# Web Framework
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+# ==============================================================
+# CA / CS Content Processing Backend — requirements.txt
+# ==============================================================
+
+# ── Web Framework ──────────────────────────────────────────────
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
 python-multipart==0.0.9
 
-# AWS S3
+# ── AWS S3 ─────────────────────────────────────────────────────
 boto3==1.34.34
+botocore==1.34.34          # pinned to match boto3
 
-# PDF Processing
-PyPDF2==3.0.1
+# ── PDF Processing ─────────────────────────────────────────────
+pypdf==4.3.1               # replaces PyPDF2 (actively maintained)
 pdfplumber==0.10.3
 reportlab==4.0.9
-Pillow==10.4.0
+pymupdf==1.24.9            # fitz — PDF-to-image for video right panel
 
-# LLM APIs
-google-generativeai==0.3.2
+# ── Image / Pillow ─────────────────────────────────────────────
+pillow==10.4.0             # latest 10.x; compatible with pymupdf + moviepy
+
+# ── LLM APIs ───────────────────────────────────────────────────
 openai>=1.40.0
+google-generativeai==0.7.2 # latest stable 0.7.x
+httpx>=0.27.0              # used directly for Anthropic + ElevenLabs REST calls
 
-# Database
+# ── Database ───────────────────────────────────────────────────
 pymongo==4.6.0
 
-# Audio Generation
-elevenlabs>=1.2.0
-pydub==0.25.1
+# ── Audio Generation ───────────────────────────────────────────
+# ElevenLabs SDK is NOT used — AudioService calls the REST API
+# directly via httpx, so no SDK dependency needed here.
+pydub==0.25.1              # audio segment stitching
 
-# Video Generation
+# ── Video Generation ───────────────────────────────────────────
 moviepy==1.0.3
-opencv-python-headless==4.9.0.80
+# opencv-python pinned BELOW 4.10 to stay compatible with numpy 1.x
+opencv-python==4.9.0.80
 
-# NumPy
+# ── CRITICAL: NumPy — must be 1.x for OpenCV + MoviePy ────────
+# numpy 2.x breaks opencv-python<4.10 and moviepy 1.x
 numpy==1.26.4
 
-# Utilities
+# ── Utilities ──────────────────────────────────────────────────
 python-dotenv==1.0.1
 requests==2.31.0
 aiohttp==3.9.3
-pydantic==2.8.2
-pydantic-settings==2.2.1
-httpx>=0.27.0
+pydantic==2.6.1
+
+# ── Auth / Crypto (needed by CA backend main.py) ───────────────
+python-jose[cryptography]==3.3.0
+passlib[pbkdf2-sha256]==1.7.4
