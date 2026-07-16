@@ -26,10 +26,42 @@ Key features
   - Characters: Raj (male student A) and Priya (female teacher B).
   - Works for both CA and CS platforms via platform= argument.
   - 7-15 min videos supported naturally (no hard cap).
+
+MEMORY / PERFORMANCE NOTES (2026-07 rewrite)
+---------------------------------------------
+The previous version rendered every frame of every segment into a PIL
+Image, converted it to a NumPy array, and appended it to a Python list
+BEFORE handing it to MoviePy:
+
+    frames: List[np.ndarray] = []
+    for f in range(n):
+        ...
+        frames.append(np.array(img))
+    def make_frame(t):
+        return frames[min(int(t * FPS), n - 1)]
+
+That means the entire video lived in RAM at once. At 1280x720x3 bytes
+per frame, 24 fps, a 10-minute video is ~39 GB of raw frame data alone
+before MoviePy/ffmpeg overhead.
+
+This version renders each frame ON DEMAND inside `make_frame(t)`. MoviePy
+(and ffmpeg underneath it) calls `make_frame` once per output frame as it
+encodes, so at any instant only ONE frame exists in memory. There is no
+`frames` list anywhere in this file. Peak memory now scales with a
+single frame + a small bounded PDF-page cache, not with video length.
+
+Other efficiency changes:
+  - Fonts are loaded once per (style, size) and cached (`@lru_cache`)
+    instead of re-reading font files off disk on every draw call.
+  - Rendered PDF pages are cached with a small bounded LRU (default 6
+    pages) instead of an unbounded per-segment dict, so long videos that
+    revisit earlier pages don't slowly leak memory.
 """
 
 from moviepy.editor import AudioFileClip, VideoClip, concatenate_videoclips
 from PIL import Image, ImageDraw, ImageFont
+from functools import lru_cache
+from collections import OrderedDict
 import numpy as np
 import os
 import re
@@ -39,7 +71,7 @@ from typing import List, Dict, Optional
 _INTER_SEGMENT_PAUSE_SEC = 0.300   # keep in sync with audio_service.py
 
 # ---------------------------------------------------------------------------
-# Font loader
+# Font loader (cached — avoids re-reading font files every draw call)
 # ---------------------------------------------------------------------------
 _FONT_PATHS = {
     "regular": [
@@ -61,6 +93,7 @@ _FONT_PATHS = {
 }
 
 
+@lru_cache(maxsize=64)
 def _load_font(style: str = "regular", size: int = 28) -> ImageFont.FreeTypeFont:
     for path in _FONT_PATHS.get(style, _FONT_PATHS["regular"]):
         if os.path.exists(path):
@@ -178,6 +211,7 @@ def _render_pdf_page(pdf_path: str, page_num: int,
 
         # Single LANCZOS downsample from 4× hires to display size
         display = hires.resize((dw, dh), Image.LANCZOS)
+        hires.close()  # free the (much larger) supersampled buffer immediately
 
         # ── Step 2: Sharpen/enhance AFTER downscale ────────────────────────
         # Sharpening at display resolution recovers edge detail that
@@ -204,10 +238,14 @@ _TOC_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+
+@lru_cache(maxsize=512)
 def _is_toc_page(pdf_path: str, page_num: int) -> bool:
     """
     Return True if the page looks like a Table of Contents, index, or cover.
     Checks: keyword match in text + high ratio of short lines (TOC structure).
+    Cached (per pdf_path/page_num) since this is called repeatedly while
+    scanning forward for the next non-TOC page.
     """
     fitz = _try_fitz()
     if not fitz or not pdf_path:
@@ -267,6 +305,11 @@ class VideoService:
     CHAR_W   = 640   # left half
     PDF_W    = 640   # right half
 
+    # ── PDF page cache size ──────────────────────────────────────────────────
+    # Bounded LRU: keeps memory flat even for very long videos that revisit
+    # earlier pages, instead of caching every rendered page forever.
+    PDF_CACHE_MAX_PAGES = 6
+
     # ── Brand palette ────────────────────────────────────────────────────────
     BRAND_DARK  = (20,  52, 105)
     BRAND_MID   = (35,  88, 162)
@@ -325,9 +368,11 @@ class VideoService:
 
     # ────────────────────────────────────────────────────────────────────────
     def __init__(self):
-        self._pdf_path:  Optional[str]                     = None
-        self._pdf_pages: int                               = 0
-        self._pdf_cache: Dict[int, Optional[Image.Image]]  = {}
+        self._pdf_path:  Optional[str] = None
+        self._pdf_pages: int           = 0
+        # Bounded LRU cache: OrderedDict of {page_num: Optional[Image.Image]}
+        self._pdf_cache: "OrderedDict[int, Optional[Image.Image]]" = OrderedDict()
+        self._page_timeline: List[Dict] = []
 
     # =========================================================================
     # Public API
@@ -347,7 +392,7 @@ class VideoService:
 
         self._pdf_path  = pdf_path
         self._pdf_pages = _pdf_page_count(pdf_path) if pdf_path else 0
-        self._pdf_cache = {}
+        self._pdf_cache.clear()
 
         if not subject_label:
             subject_label = "CA" if platform == "ca" else "CS"
@@ -355,7 +400,7 @@ class VideoService:
             "Chartered Accountancy" if platform == "ca" else "Company Secretary"
         )
 
-        segments   = self._parse_transcript(transcript)
+        segments = self._parse_transcript(transcript)
         if not segments:
             raise Exception("No dialogue segments found in transcript.")
 
@@ -370,31 +415,15 @@ class VideoService:
                 seg["speak_end"] = seg["duration"] * 0.90
 
         total_segs = len(segments)
-        clips      = []
-        global_t   = 0.0   # running wall-clock for _page_at() alignment
 
-        # Re-build timeline with REAL durations now that segment_durations applied
-        # (first parse used word-count estimates; now we have the real values)
-        block_start = 0.0
-        prev_page   = segments[0]["page"]  if segments else 1
-        prev_topic  = segments[0]["topic"] if segments else "Introduction"
-        self._page_timeline = []
-        for seg in segments:
-            if seg["page"] != prev_page or seg["topic"] != prev_topic:
-                self._page_timeline.append({
-                    "t_start": block_start, "t_end": global_t,
-                    "page": prev_page, "topic": prev_topic,
-                })
-                block_start = global_t
-                prev_page, prev_topic = seg["page"], seg["topic"]
-            global_t += seg["duration"]
-        self._page_timeline.append({
-            "t_start": block_start, "t_end": global_t,
-            "page": prev_page, "topic": prev_topic,
-        })
+        # Rebuild the page timeline now that REAL durations are known
+        # (the first parse used word-count estimates).
+        self._rebuild_page_timeline(segments)
+        total_len_min = (self._page_timeline[-1]["t_end"] / 60) if self._page_timeline else 0
         print(f"[VideoService] Timeline rebuilt: {len(self._page_timeline)} page blocks, "
-              f"total {global_t/60:.1f} min")
+              f"total {total_len_min:.1f} min")
 
+        clips    = []
         global_t = 0.0
         for idx, seg in enumerate(segments):
             char  = self.CHAR_A if seg["is_a"] else self.CHAR_B
@@ -406,18 +435,14 @@ class VideoService:
                     listener       = other,
                     duration       = seg["duration"],
                     speak_end      = seg["speak_end"],
-                    page_number    = seg["page"],
-                    topic_name     = seg["topic"],
                     seg_index      = idx,
                     total_segs     = total_segs,
                     platform_full  = platform_full,
                     subject_label  = subject_label,
-                    global_t_start = global_t,   # ← wall-clock start of this clip
+                    global_t_start = global_t,
                 )
             )
             global_t += seg["duration"]
-            if idx % 15 == 0:
-                self._pdf_cache.clear()
 
         video = concatenate_videoclips(clips, method="compose")
 
@@ -436,6 +461,7 @@ class VideoService:
             preset="medium", logger=None,
         )
         video.close()
+        self._pdf_cache.clear()
         return output_path
 
     def create_simple_animated_video(
@@ -446,60 +472,44 @@ class VideoService:
         return self.create_animated_video_from_transcript("\n".join(lines), output_path)
 
     # =========================================================================
-    # Clip builder
+    # Clip builder — LAZY. Renders one frame at a time on demand; never
+    # materializes a list of frames for the whole segment.
     # =========================================================================
 
     def _build_clip(
         self,
         text: str, speaker: dict, listener: dict,
         duration: float, speak_end: float,
-        page_number: int, topic_name: str,
         seg_index: int, total_segs: int,
         platform_full: str, subject_label: str,
-        global_t_start: float = 0.0,   # wall-clock start of this segment
+        global_t_start: float = 0.0,
     ) -> VideoClip:
         """
-        Build one dialogue segment as a VideoClip.
+        Build one dialogue segment as a lazily-evaluated VideoClip.
 
-        PDF panel now tracks global time via _page_at(global_t), so the page
-        can advance MID-CLIP when a tag boundary falls inside this segment.
-        A 0.4-second page-turn flash (white fade) marks each page change.
+        Nothing here allocates per-frame storage. `make_frame(t_local)` is
+        handed to MoviePy, which calls it exactly once per output frame at
+        encode time — so only a single PIL Image / NumPy array exists in
+        memory at any given moment, regardless of segment length.
         """
-        W, H, FPS = self.W, self.H, self.FPS
-        n         = max(1, int(duration * FPS))
+        FPS = self.FPS
 
-        # Pre-render all pages this segment might show
-        page_cache: Dict[int, Optional[Image.Image]] = {}
-        def get_frame_page(p: int) -> Optional[Image.Image]:
-            if p not in page_cache:
-                page_cache[p] = self._get_pdf_page(p)
-            return page_cache[p]
-
-        img  = Image.new("RGB", (W, H))
-        draw = ImageDraw.Draw(img)
-
-        frames: List[np.ndarray] = []
-        prev_page = page_number   # track page changes for flash effect
-
-        for f in range(n):
-            t_local  = f / FPS
-            global_t = global_t_start + t_local
-
+        def make_frame(t_local: float) -> np.ndarray:
+            global_t    = global_t_start + t_local
             is_speaking = t_local < speak_end
             text_prog   = (t_local / speak_end) if (is_speaking and speak_end > 0) else 1.0
-            progress    = (global_t_start / max(1, global_t_start + duration))                           if total_segs == 1                           else (seg_index + f / n) / total_segs
+            progress    = (
+                (global_t_start / max(1, global_t_start + duration))
+                if total_segs == 1
+                else (seg_index + (t_local / duration if duration > 0 else 1.0)) / total_segs
+            )
 
-            # ── Determine current page/topic from global timeline ─────────
             cur_page, cur_topic = self._page_at(global_t)
-            pdf_img = get_frame_page(cur_page)
+            pdf_img = self._get_pdf_page(cur_page)
 
-            # ── Page-turn flash: 0.4 s white overlay on page change ───────
-            page_changed = (cur_page != prev_page)
-            if page_changed:
-                prev_page = cur_page
-
-            # Detect how many seconds since the last page boundary
-            flash_dur  = 0.35   # seconds of flash
+            # Page-turn flash: 0.35s white overlay measured from the start
+            # of the current page/topic block in the global timeline.
+            flash_dur    = 0.35
             t_into_block = global_t
             for block in self._page_timeline:
                 if block["page"] == cur_page and block["topic"] == cur_topic:
@@ -507,7 +517,9 @@ class VideoService:
                     break
             flash_alpha = max(0.0, 1.0 - t_into_block / flash_dur) if t_into_block < flash_dur else 0.0
 
-            # ── Draw ──────────────────────────────────────────────────────
+            img  = Image.new("RGB", (self.W, self.H))
+            draw = ImageDraw.Draw(img)
+
             self._draw_char_panel(draw, t_local)
             self._draw_character(draw, listener, t_local, speaking=False)
             self._draw_character(draw, speaker,  t_local, speaking=is_speaking)
@@ -517,18 +529,15 @@ class VideoService:
                 t_local, is_speaking, flash_alpha,
             )
             draw.line(
-                [(self.CHAR_W, self.HEADER_H), (self.CHAR_W, H - self.FOOTER_H)],
+                [(self.CHAR_W, self.HEADER_H), (self.CHAR_W, self.H - self.FOOTER_H)],
                 fill=self.BRAND_MID, width=3,
             )
             self._draw_header(draw, platform_full, subject_label, cur_topic, cur_page)
             self._draw_footer(draw, progress, seg_index, total_segs)
 
-            frames.append(np.array(img))
+            return np.array(img)
 
-        def make_frame(t_sec: float) -> np.ndarray:
-            return frames[min(int(t_sec * FPS), n - 1)]
-
-        return VideoClip(make_frame, duration=duration)
+        return VideoClip(make_frame, duration=duration).set_fps(FPS)
 
     # =========================================================================
     # Header bar
@@ -767,6 +776,10 @@ class VideoService:
         _render_pdf_page uses 4× supersampling then LANCZOS-downscales to
         exactly this size — the returned image must NEVER be resized again.
         TOC/index/cover pages are skipped automatically.
+
+        Cache is a bounded LRU (PDF_CACHE_MAX_PAGES). This keeps memory flat
+        even for very long videos that jump between many pages, instead of
+        an unbounded dict that only ever grows.
         """
         if not self._pdf_path or page_number < 1:
             return None
@@ -778,15 +791,22 @@ class VideoService:
                 resolved = candidate
                 break
 
-        if resolved not in self._pdf_cache:
-            # Exact panel dimensions — no padding taken out here,
-            # _draw_pdf_panel handles its own 4px inset shadow margin
-            render_w = self.PDF_W - 8        # 632 px — fills panel with 4px margin each side
-            render_h = self.H - self.HEADER_H - self.FOOTER_H - 40  # 600 px usable height
-            self._pdf_cache[resolved] = _render_pdf_page(
-                self._pdf_path, resolved, render_w, render_h,
-            )
-        return self._pdf_cache.get(resolved)
+        if resolved in self._pdf_cache:
+            self._pdf_cache.move_to_end(resolved)   # mark as recently used
+            return self._pdf_cache[resolved]
+
+        # Exact panel dimensions — no padding taken out here,
+        # _draw_pdf_panel handles its own 4px inset shadow margin
+        render_w = self.PDF_W - 8        # 632 px — fills panel with 4px margin each side
+        render_h = self.H - self.HEADER_H - self.FOOTER_H - 40  # 600 px usable height
+        rendered = _render_pdf_page(self._pdf_path, resolved, render_w, render_h)
+
+        self._pdf_cache[resolved] = rendered
+        self._pdf_cache.move_to_end(resolved)
+        while len(self._pdf_cache) > self.PDF_CACHE_MAX_PAGES:
+            self._pdf_cache.popitem(last=False)   # evict least-recently-used
+
+        return rendered
 
     # =========================================================================
     # Character drawing
@@ -1077,8 +1097,8 @@ class VideoService:
         Robust parser:
           - Reads STANDALONE tag lines:   [PAGE 3] [TOPIC: Bank Reconciliation]
           - Also reads inline tags inside A:/B: dialogue
-          - Builds a global _page_timeline so the PDF panel advances smoothly
-            across segment boundaries (not stuck per-segment)
+          - Builds an initial global _page_timeline (rebuilt again with real
+            durations once TTS timing is known — see _rebuild_page_timeline)
         """
         segments: List[Dict] = []
         current_page  = 1
@@ -1158,10 +1178,21 @@ class VideoService:
                     "topic": "Introduction",
                 })
 
-        # ── Build global page timeline ────────────────────────────────────
-        # Each block = {t_start, t_end, page, topic} in wall-clock seconds.
-        # Used by _page_at(global_t) to drive the PDF panel frame-accurately.
-        self._page_timeline: List[Dict] = []
+        self._rebuild_page_timeline(segments)
+        total_min = (self._page_timeline[-1]["t_end"] / 60) if self._page_timeline else 0
+        print(f"[VideoService] {len(segments)} segments, "
+              f"{len(self._page_timeline)} page blocks, "
+              f"total ≈{total_min:.1f} min")
+        return segments
+
+    def _rebuild_page_timeline(self, segments: List[Dict]) -> None:
+        """
+        Build self._page_timeline = [{t_start, t_end, page, topic}, ...] in
+        wall-clock seconds from a list of segments (each with a known
+        "duration"). Called once with estimated durations during parsing,
+        and again after real TTS durations are known.
+        """
+        timeline: List[Dict] = []
         cumulative  = 0.0
         block_start = 0.0
         prev_page   = segments[0]["page"]  if segments else 1
@@ -1169,7 +1200,7 @@ class VideoService:
 
         for seg in segments:
             if seg["page"] != prev_page or seg["topic"] != prev_topic:
-                self._page_timeline.append({
+                timeline.append({
                     "t_start": block_start,
                     "t_end":   cumulative,
                     "page":    prev_page,
@@ -1180,18 +1211,13 @@ class VideoService:
                 prev_topic  = seg["topic"]
             cumulative += seg["duration"]
 
-        self._page_timeline.append({
+        timeline.append({
             "t_start": block_start,
             "t_end":   cumulative,
             "page":    prev_page,
             "topic":   prev_topic,
         })
-
-        total_min = cumulative / 60
-        print(f"[VideoService] {len(segments)} segments, "
-              f"{len(self._page_timeline)} page blocks, "
-              f"total ≈{total_min:.1f} min")
-        return segments
+        self._page_timeline = timeline
 
     def _page_at(self, global_t: float) -> tuple:
         """Return (page, topic) for any global video timestamp."""
@@ -1202,7 +1228,6 @@ class VideoService:
             last = self._page_timeline[-1]
             return last["page"], last["topic"]
         return 1, "Introduction"
-
 
     # =========================================================================
     # Colour utilities
