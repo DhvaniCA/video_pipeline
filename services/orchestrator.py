@@ -118,7 +118,8 @@ class ContentProcessingOrchestrator:
 
             # ----------------------------------------------------------------
             # Step 5: Generate video transcript from simplified PDF text
-            #         Length is scaled by page count: 5p→10min, 10p→14min, 11+→20min
+            #         Length is now word-budgeted to target 10-18 minutes
+            #         based on page count — see llm_service._target_minutes_for_pages
             # ----------------------------------------------------------------
             simplified_page_count = simplified_extracted.get("total_pages", 0)
             # Fall back to original PDF page count if simplified count not available
@@ -133,12 +134,19 @@ class ContentProcessingOrchestrator:
 
             # ----------------------------------------------------------------
             # Step 6: Generate audio from transcript
+            #         audio_service enforces a hard 18-min cap independent of
+            #         the transcript's word-budget target (real TTS pacing can
+            #         vary), and returns transcript_for_video trimmed to match
+            #         whatever actually made it into the final audio file.
             # ----------------------------------------------------------------
             print(f"[Job {job_id}] Generating audio from transcript...")
             audio_path = os.path.join(temp_dir, "audio.mp3")
-            audio_path, seg_durations = self.audio.generate_audio_from_transcript(
-                transcript, audio_path
+            audio_path, seg_durations, transcript_for_video = (
+                self.audio.generate_audio_from_transcript(transcript, audio_path)
             )
+            total_audio_min = sum(seg_durations) / 60.0
+            print(f"[Job {job_id}] ✓ Audio ready: {len(seg_durations)} segments, "
+                  f"~{total_audio_min:.1f} min")
 
             # ----------------------------------------------------------------
             # Step 7: Upload audio to S3
@@ -161,11 +169,14 @@ class ContentProcessingOrchestrator:
 
             # ----------------------------------------------------------------
             # Step 8: Create animated video
+            #         Uses transcript_for_video (audio-aligned) rather than the
+            #         raw generated transcript, so PDF-panel sync always
+            #         matches what's actually audible in the final file.
             # ----------------------------------------------------------------
             print(f"[Job {job_id}] Creating animated video...")
             video_path = os.path.join(temp_dir, "video.mp4")
             self.video.create_animated_video_from_transcript(
-                transcript        = transcript,
+                transcript        = transcript_for_video,
                 output_path       = video_path,
                 audio_path        = audio_path,
                 segment_durations = seg_durations,
@@ -190,8 +201,9 @@ class ContentProcessingOrchestrator:
                 "video_url": video_url,
                 "status": "completed",
                 "metadata": {
-                    "transcript": transcript,
+                    "transcript": transcript_for_video,
                     "original_pages": original_pages,
+                    "video_length_minutes": round(total_audio_min, 1),
                     "completed_at": datetime.utcnow().isoformat(),
                 },
             })
@@ -208,7 +220,8 @@ class ContentProcessingOrchestrator:
                 else:
                     print(f"[Job {job_id}] ✗ Failed to update {self.platform}_dashboard {dashboard_id}")
 
-            print(f"[Job {job_id}] ✅ Processing completed successfully!")
+            print(f"[Job {job_id}] ✅ Processing completed successfully! "
+                  f"(~{total_audio_min:.1f} min video)")
 
         except Exception as e:
             error_msg = str(e)
