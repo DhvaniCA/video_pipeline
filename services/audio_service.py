@@ -8,19 +8,43 @@ Male Instructor  → ElevenLabs "Raj"    (Indian English male)
 Female Student   → ElevenLabs "Sana"   (Indian English female)
 
 Returns:
-    (output_path: str, segment_durations: List[float])
+    (output_path: str, segment_durations: List[float], transcript_used: str)
+
+EFFICIENCY / LENGTH-CONTROL NOTES (2026-07 rewrite)
+----------------------------------------------------
+1. Sticky quota skip: previously, once ElevenLabs quota ran out, EVERY
+   remaining segment still tried primary ElevenLabs (fail) → backup
+   ElevenLabs (fail) → OpenAI (success) — two guaranteed wasted network
+   round-trips per segment for the rest of the job. Now, the first
+   "quota_exceeded" response sets a sticky flag and all later segments
+   skip straight to OpenAI TTS.
+
+2. Concurrent generation: segments are independent TTS calls (network-
+   bound), so they're now generated in parallel via a thread pool instead
+   of one-at-a-time. Final audio is still assembled in the original
+   dialogue order.
+
+3. Hard duration cap: even with word-budgeted transcripts from
+   llm_service, real TTS pacing can vary. After assembly, if total audio
+   exceeds MAX_VIDEO_SECONDS (18 min), it's trimmed to the last full
+   segment that fits, and the transcript text is truncated to match (via
+   llm_service.truncate_transcript_to_dialogue_count) so the video's PDF
+   panel / dialogue stays in sync with what's actually in the final audio.
 """
 
 import os
 import re
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 from typing import List, Dict, Tuple
 
 from pydub import AudioSegment
 
 from config import config
+from services.llm_service import truncate_transcript_to_dialogue_count
 
 # ---------------------------------------------------------------------------
 # Voice IDs
@@ -34,6 +58,9 @@ _ELEVENLABS_MODEL    = "eleven_multilingual_v2"
 _ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"   # never changes
 _INTER_SEGMENT_PAUSE_MS = 300
 _REQUEST_TIMEOUT        = 60.0
+
+_MAX_TTS_WORKERS       = 4          # concurrent TTS requests
+_MAX_VIDEO_SECONDS     = 18 * 60    # hard ceiling — matches llm_service cap
 
 
 class AudioService:
@@ -59,6 +86,11 @@ class AudioService:
             print(f"[AudioService] 🎙️  Model        : {_ELEVENLABS_MODEL}")
             self._elevenlabs_available = True
 
+        # Sticky flag: once ElevenLabs reports quota_exceeded, stop trying it
+        # for the rest of this job (both primary and backup voices share the
+        # same account quota, so retrying either is pointless).
+        self._el_quota_exhausted = threading.Event()
+
         # OpenAI fallback
         try:
             from openai import OpenAI as _OpenAI
@@ -78,40 +110,58 @@ class AudioService:
 
     def generate_audio_from_transcript(
         self, transcript: str, output_path: str
-    ) -> Tuple[str, List[float]]:
+    ) -> Tuple[str, List[float], str]:
         """
-        Generate dual-voice MP3. Returns (output_path, segment_durations).
+        Generate dual-voice MP3.
+        Returns (output_path, segment_durations, transcript_used).
+
+        transcript_used is the ORIGINAL transcript unless the hard 18-min
+        cap had to trim trailing segments — in that case it's the
+        correspondingly truncated transcript, so video_service (which
+        parses the transcript for PAGE/TOPIC sync) stays consistent with
+        the audio that's actually in the final file.
         """
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         temp_dir = tempfile.mkdtemp(prefix="audio_seg_")
+        self._el_quota_exhausted.clear()
 
         try:
             segments = self._parse_transcript_segments(transcript)
             if not segments:
                 raise Exception("No dialogue segments found in transcript")
 
-            print(f"[AudioService] Found {len(segments)} dialogue segments")
+            n = len(segments)
+            print(f"[AudioService] Found {n} dialogue segments "
+                  f"(generating up to {_MAX_TTS_WORKERS} at a time)")
 
+            seg_paths: List[str] = [
+                os.path.join(temp_dir, f"seg_{i:04d}.mp3") for i in range(n)
+            ]
+
+            # ── Generate all segments concurrently (network-bound work) ──
+            def _generate_one(i: int) -> None:
+                seg      = segments[i]
+                speaker  = seg["speaker"]
+                text     = seg["text"]
+                label    = "Instructor (Male)" if speaker == "A" else "Student (Female)"
+                print(f"  [{i+1}/{n}] {label}: {text[:70]}...")
+
+                success = self._tts_with_fallback(speaker, text, seg_paths[i])
+                if not success:
+                    words       = len(text.split())
+                    duration_ms = max(1500, words * 400)
+                    AudioSegment.silent(duration=duration_ms).export(seg_paths[i], format="mp3")
+                    print(f"  ⚠️  Segment {i}: silence placeholder ({duration_ms}ms)")
+
+            with ThreadPoolExecutor(max_workers=_MAX_TTS_WORKERS) as pool:
+                list(pool.map(_generate_one, range(n)))
+
+            # ── Assemble in original order ────────────────────────────────
             final_audio     = AudioSegment.empty()
             silence_between = AudioSegment.silent(duration=_INTER_SEGMENT_PAUSE_MS)
             segment_durations: List[float] = []
 
-            for i, seg in enumerate(segments):
-                speaker  = seg["speaker"]
-                text     = seg["text"]
-                label    = "Instructor (Male)" if speaker == "A" else "Student (Female)"
-                seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp3")
-
-                print(f"  [{i+1}/{len(segments)}] {label}: {text[:70]}...")
-
-                success = self._tts_with_fallback(speaker, text, seg_path)
-
-                if not success:
-                    words       = len(text.split())
-                    duration_ms = max(1500, words * 400)
-                    AudioSegment.silent(duration=duration_ms).export(seg_path, format="mp3")
-                    print(f"  ⚠️  Segment {i}: silence placeholder ({duration_ms}ms)")
-
+            for i, seg_path in enumerate(seg_paths):
                 try:
                     seg_audio = AudioSegment.from_mp3(seg_path)
                     combined  = seg_audio + silence_between
@@ -119,17 +169,38 @@ class AudioService:
                     final_audio += combined
                 except Exception as load_err:
                     print(f"  ⚠️  Could not load segment {i}: {load_err}")
-                    segment_durations.append(max(3.0, len(text.split()) / 2.5))
+                    segment_durations.append(max(3.0, len(segments[i]["text"].split()) / 2.5))
 
             if len(final_audio) == 0:
                 raise Exception("All audio segments failed to generate")
 
+            # ── Hard cap: trim to MAX_VIDEO_SECONDS if real pacing overshot ──
+            transcript_used = transcript
+            total_s = len(final_audio) / 1000.0
+            if total_s > _MAX_VIDEO_SECONDS:
+                cumulative = 0.0
+                keep_count = 0
+                for d in segment_durations:
+                    if cumulative + d > _MAX_VIDEO_SECONDS:
+                        break
+                    cumulative += d
+                    keep_count += 1
+                keep_count = max(1, keep_count)
+
+                print(f"[AudioService] ✂️  Total {total_s:.1f}s exceeds "
+                      f"{_MAX_VIDEO_SECONDS}s cap — trimming to first {keep_count}/{n} segments "
+                      f"(~{cumulative:.1f}s)")
+
+                final_audio = final_audio[: int(cumulative * 1000)]
+                segment_durations = segment_durations[:keep_count]
+                transcript_used = truncate_transcript_to_dialogue_count(transcript, keep_count)
+
             total_s = len(final_audio) / 1000
-            print(f"\n[AudioService] ✅ Total audio: {total_s:.1f}s")
-            print(f"[AudioService] Durations: {[round(d, 2) for d in segment_durations]}")
+            print(f"\n[AudioService] ✅ Total audio: {total_s:.1f}s "
+                  f"({total_s/60:.1f} min)")
 
             final_audio.export(output_path, format="mp3", bitrate="192k")
-            return output_path, segment_durations
+            return output_path, segment_durations, transcript_used
 
         finally:
             try:
@@ -147,13 +218,23 @@ class AudioService:
         backup    = _VOICE_MALE_BACKUP   if is_male else _VOICE_FEMALE_BACKUP
         oai_voice = "onyx"               if is_male else "nova"
 
-        if self._elevenlabs_tts(text, primary, seg_path):
-            return True
-        print("  ↳ Primary voice failed, trying backup…")
-
-        if self._elevenlabs_tts(text, backup, seg_path):
-            return True
-        print("  ↳ Backup voice failed, trying OpenAI TTS…")
+        if not self._el_quota_exhausted.is_set():
+            ok, quota_hit = self._elevenlabs_tts(text, primary, seg_path)
+            if ok:
+                return True
+            if quota_hit:
+                self._el_quota_exhausted.set()
+                print("  ↳ ElevenLabs quota exhausted — skipping ElevenLabs for rest of job")
+            else:
+                print("  ↳ Primary voice failed, trying backup…")
+                ok, quota_hit = self._elevenlabs_tts(text, backup, seg_path)
+                if ok:
+                    return True
+                if quota_hit:
+                    self._el_quota_exhausted.set()
+                    print("  ↳ ElevenLabs quota exhausted — skipping ElevenLabs for rest of job")
+                else:
+                    print("  ↳ Backup voice failed, trying OpenAI TTS…")
 
         return self._openai_tts(text, oai_voice, seg_path)
 
@@ -161,10 +242,14 @@ class AudioService:
     # Internal: ElevenLabs via direct httpx (no SDK)
     # ------------------------------------------------------------------
 
-    def _elevenlabs_tts(self, text: str, voice_id: str, output_path: str) -> bool:
-        """Call ElevenLabs REST API directly — xi-api-key always explicitly set."""
+    def _elevenlabs_tts(self, text: str, voice_id: str, output_path: str) -> Tuple[bool, bool]:
+        """
+        Call ElevenLabs REST API directly — xi-api-key always explicitly set.
+        Returns (success, quota_exceeded) so the caller can set the sticky
+        skip flag on quota errors specifically (vs. other transient failures).
+        """
         if not self._elevenlabs_available:
-            return False
+            return False, False
 
         url = f"{_ELEVENLABS_BASE_URL}/v1/text-to-speech/{voice_id}"
         headers = {
@@ -190,9 +275,10 @@ class AudioService:
                 resp = client.post(url, json=payload, headers=headers)
 
             if resp.status_code != 200:
-                print(f"    [✗ ElevenLabs] HTTP {resp.status_code} voice={voice_id[:8]}…: "
-                      f"{resp.text[:200]}")
-                return False
+                body = resp.text[:300]
+                quota_hit = "quota_exceeded" in body
+                print(f"    [✗ ElevenLabs] HTTP {resp.status_code} voice={voice_id[:8]}…: {body[:200]}")
+                return False, quota_hit
 
             with open(output_path, "wb") as f:
                 f.write(resp.content)
@@ -200,14 +286,14 @@ class AudioService:
             size = os.path.getsize(output_path)
             if size < 1000:
                 print(f"    [✗ ElevenLabs] File too small ({size}B) voice={voice_id[:8]}…")
-                return False
+                return False, False
 
             print(f"    [✓ ElevenLabs] voice={voice_id[:8]}… ({size // 1024}KB)")
-            return True
+            return True, False
 
         except Exception as e:
             print(f"    [✗ ElevenLabs] voice={voice_id[:8]}… exception: {e}")
-            return False
+            return False, False
 
     # ------------------------------------------------------------------
     # Internal: OpenAI TTS fallback
@@ -278,8 +364,12 @@ class AudioService:
 
     def generate_audio_from_text(self, text: str, output_path: str, lang: str = "en") -> str:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        if not self._elevenlabs_tts(text, _VOICE_MALE, output_path):
-            if not self._elevenlabs_tts(text, _VOICE_MALE_BACKUP, output_path):
+        ok, quota_hit = self._elevenlabs_tts(text, _VOICE_MALE, output_path)
+        if not ok:
+            if quota_hit:
+                self._el_quota_exhausted.set()
+            ok, quota_hit = self._elevenlabs_tts(text, _VOICE_MALE_BACKUP, output_path)
+            if not ok:
                 self._openai_tts(text, "onyx", output_path)
         return output_path
 
