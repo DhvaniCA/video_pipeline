@@ -3,35 +3,121 @@ import google.generativeai as genai
 from typing import Dict
 from config import config
 import json
+import re
 import httpx
 
-def _truncate_transcript(transcript: str, max_exchanges: int = 35) -> str:
+from services.platform_config import PLATFORM_CONFIGS
+
+
+# ---------------------------------------------------------------------------
+# Video length control
+# ---------------------------------------------------------------------------
+# Everything about transcript length flows from ONE number: words-per-minute
+# of spoken dialogue. video_service.py estimates duration as
+#     duration = words / 120 * 60      (i.e. 120 words/minute)
+# so we budget the SCRIPT in words against that same rate. This is the
+# single source of truth for "how long will this video be" — no more
+# disconnected exchange-counts that don't match the actual cap.
+_WORDS_PER_MINUTE   = 120
+_HARD_CAP_MINUTES   = 18     # absolute ceiling — never target above this
+_TARGET_BUFFER      = 1.10   # allow the model 10% headroom before truncating
+
+
+def _target_minutes_for_pages(pdf_page_count: int) -> int:
     """
-    Hard-limit the transcript to max_exchanges A+B pairs.
-    Preserves all [PAGE] / [TOPIC] tags and the Yaad Rakho section.
-    Called after LLM generation as a safety net against over-long output.
+    Page count → target video length, capped at _HARD_CAP_MINUTES.
+    Deliberately conservative so real TTS pacing (which can run a little
+    slower than the 120 wpm estimate) still lands inside 15-18 min.
     """
-    import re as _re
-    lines        = transcript.splitlines()
-    exchange_count = 0
-    output       = []
-    line_re      = _re.compile(r'^[AB]\s*:', _re.IGNORECASE)
+    if pdf_page_count <= 4:
+        return 10
+    if pdf_page_count <= 8:
+        return 13
+    if pdf_page_count <= 12:
+        return 15
+    return _HARD_CAP_MINUTES  # 13+ pages: cap at 18, never scale further
+
+
+def truncate_transcript_to_word_budget(transcript: str, max_words: int) -> str:
+    """
+    Cut the transcript once cumulative spoken words (inside A:/B: lines)
+    reaches max_words, then look forward for the "Yaad Rakho" / key
+    takeaways closer so the video ends cleanly instead of mid-sentence.
+    All [PAGE]/[TOPIC] tag lines before the cutoff are preserved so the
+    PDF panel in the video still syncs correctly for the content that
+    actually plays.
+    """
+    lines    = transcript.splitlines()
+    line_re  = re.compile(r'^\**\s*(?:User\s*)?([AB])\**\s*:\s*(.*)$', re.IGNORECASE)
+    output   = []
+    word_count      = 0
+    cutoff_reached  = False
+    yaad_found      = False
 
     for line in lines:
-        if line_re.match(line.strip()):
-            exchange_count += 1
-            if exchange_count > max_exchanges:
+        stripped = line.strip()
+
+        if cutoff_reached:
+            if not yaad_found:
+                if "yaad rakho" in stripped.lower() or "key takeaway" in stripped.lower():
+                    yaad_found = True
+                    output.append(line)
+                continue
+            # Inside the Yaad Rakho block: keep bullets, stop at the next
+            # dialogue line or tag (i.e. don't drag in leftover content).
+            if line_re.match(stripped) or stripped.upper().startswith("[PAGE") \
+               or stripped.upper().startswith("[TOPIC"):
                 break
+            output.append(line)
+            continue
+
+        m = line_re.match(stripped)
+        if m:
+            word_count += len(m.group(2).split())
         output.append(line)
-        # If we hit the Yaad Rakho section, include it and stop
-        if "yaad rakho" in line.lower() or "key takeaway" in line.lower():
-            # collect the bullet points that follow
-            pass   # they'll be added normally in the loop
+        if m and word_count >= max_words:
+            cutoff_reached = True
 
     return "\n".join(output).strip()
 
 
-from services.platform_config import PLATFORM_CONFIGS
+def truncate_transcript_to_dialogue_count(transcript: str, max_dialogue_lines: int) -> str:
+    """
+    Cut the transcript after the Nth A:/B: line (used by audio_service as a
+    hard safety net once REAL TTS duration is known — word-count estimates
+    can run long or short depending on how ElevenLabs/OpenAI actually
+    pace the speech). Same tag-preserving, clean-ending behaviour as
+    truncate_transcript_to_word_budget.
+    """
+    lines   = transcript.splitlines()
+    line_re = re.compile(r'^\**\s*(?:User\s*)?([AB])\**\s*:\s*(.*)$', re.IGNORECASE)
+    output  = []
+    dialogue_count = 0
+    cutoff_reached = False
+    yaad_found     = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if cutoff_reached:
+            if not yaad_found:
+                if "yaad rakho" in stripped.lower() or "key takeaway" in stripped.lower():
+                    yaad_found = True
+                    output.append(line)
+                continue
+            if line_re.match(stripped) or stripped.upper().startswith("[PAGE") \
+               or stripped.upper().startswith("[TOPIC"):
+                break
+            output.append(line)
+            continue
+
+        if line_re.match(stripped):
+            dialogue_count += 1
+        output.append(line)
+        if dialogue_count >= max_dialogue_lines and line_re.match(stripped):
+            cutoff_reached = True
+
+    return "\n".join(output).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +143,12 @@ Return ONLY valid JSON (no markdown, no extra text) with this exact structure:
 """
 
 _ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-_CLAUDE_HAIKU_MODEL = "claude-sonnet-4-6"
+
+# FIX: this was previously pointed at a Sonnet-class model string while every
+# log line and comment called it "Claude Haiku". For a scripted, format-
+# constrained writing task like this transcript, Haiku is faster and cheaper
+# with no meaningful quality loss — switched to the actual Haiku model.
+_CLAUDE_HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
 class LLMService:
@@ -117,19 +208,15 @@ Simplify the following {self.cfg.subject_label} content into a structured docume
 7. Key Takeaways (5-7 points) — "Yaad Rakho" style
 """
 
-    def _transcript_task(self, target_exchanges: int = 60) -> str:
-        a    = "Raj"
-        b    = self.cfg.teacher_name
-        subj = self.cfg.subject_label
-        full = self.cfg.full_name
-        terms= self.cfg.domain_terms
-        style= self.cfg.style
+    def _transcript_task(self, target_words: int, target_minutes: int) -> str:
+        full  = self.cfg.full_name
+        terms = self.cfg.domain_terms
+        style = self.cfg.style
         lang = (
             f"Hinglish — natural Hindi + English. Technical terms ({terms}) always in English."
             if style == "hinglish"
             else f"Clear English. Technical terms ({terms}) used precisely."
         )
-        half = target_exchanges // 2
         return f"""You are writing a professional educational video script for {full} students.
 The video has LEFT panel (Raj and Priya talking) and RIGHT panel (live PDF page).
 
@@ -151,14 +238,16 @@ B: Priya — {full} teacher. Teaches with full depth:
 BANNED words: "Good luck", "Great question", "Excellent", "Wow", "Bilkul sahi",
 "Bahut accha", "Perfect", "Absolutely", "Of course", "Sure", "Amazing", any hollow praise.
 
-=== COVERAGE RULE — MOST IMPORTANT ===
-You MUST cover EVERY section, definition, formula, table, and worked example in the PDF.
-Do NOT skip any concept. Do NOT summarise when you should teach.
-Work through every numerical example step by step.
-The video must be a complete lecture on the topic — not a highlight reel.
-Target: approximately {target_exchanges} exchanges ({half} for Raj, {half} for Priya).
-If the PDF has more content than {target_exchanges} exchanges can cover, use MORE exchanges.
-Maximum allowed: {target_exchanges + 20} exchanges. Never cut content to fit a limit.
+=== LENGTH — HARD REQUIREMENT ===
+This video must run approximately {target_minutes} minutes, which means the
+TOTAL spoken dialogue (all A: and B: lines combined) must be close to
+{target_words} words. Do NOT write more than {int(target_words * 1.15)} words
+of dialogue in total — content that goes past that will be cut, so
+prioritise covering the MOST IMPORTANT concepts, formulas, and one worked
+example per major section rather than trying to cover every minor detail.
+Pick the highest-value content if the PDF has more than fits.
+Work through numerical examples concisely — show the key steps, not every
+possible variant.
 
 === PDF PAGE TAGS — MANDATORY ===
 Before every new topic, sub-topic, example, or formula insert on its OWN line:
@@ -177,15 +266,13 @@ B: [deeper explanation with formula/example]
 [PAGE 2] [TOPIC: Next Concept]
 A: [question]
 B: [answer]
-...cover all PDF content...
+...cover the highest-value content within the word budget above...
 Yaad Rakho:
 • [key point 1]
 • [key point 2]
 • [key point 3]
 • [key point 4]
 • [key point 5]
-• [key point 6]
-• [key point 7]
 """
 
     # ------------------------------------------------------------------
@@ -272,53 +359,35 @@ IMPORTANT: Return ONLY the raw JSON object. No markdown fences, no preamble.
         pdf_page_count:  int = 0,
     ) -> str:
         """
-        Generate a full-coverage transcript scaled to pdf_page_count.
-        NEVER cuts content — covers every page of the PDF completely.
-
-        Page count → target exchanges mapping:
-          1-4  pages  →  40 exchanges  (~10 min)
-          5-8  pages  →  60 exchanges  (~15 min)
-          9-12 pages  →  80 exchanges  (~20 min)
-          13+  pages  →  100 exchanges (~22 min max)
-
-        max_tokens is always 16000 so Claude never runs out of space.
-        No truncation — the full transcript is returned as-is.
+        Generate a transcript targeted at 10-18 minutes based on page count
+        (see _target_minutes_for_pages), with a word-budget prompt PLUS a
+        hard word-count truncation safety net — so length is controlled at
+        the source instead of relying on a disconnected fixed exchange cap.
         """
         if pdf_page_count <= 0:
             pdf_page_count = max(1, len(simplified_text) // 400)
 
-        if pdf_page_count <= 4:
-            target_exchanges = 40
-            target_min       = 10
-        elif pdf_page_count <= 8:
-            target_exchanges = 60
-            target_min       = 15
-        elif pdf_page_count <= 12:
-            target_exchanges = 80
-            target_min       = 20
-        else:
-            target_exchanges = 100
-            target_min       = 22
+        target_minutes = _target_minutes_for_pages(pdf_page_count)
+        target_words   = target_minutes * _WORDS_PER_MINUTE
+        max_words_hard_cap = int(target_words * _TARGET_BUFFER)
 
-        # Always 16000 — never cut Claude short mid-generation
-        self._dynamic_max_tokens = 16000
+        # Token budget scaled to the actual target instead of a flat 16000 —
+        # ~1.4 tokens/word plus formatting/tag overhead, with a safety floor.
+        self._dynamic_max_tokens = max(2500, min(6000, int(target_words * 2.2)))
 
-        print(f"[LLMService] PDF pages={pdf_page_count} → "
-              f"{target_exchanges} exchanges target, ~{target_min} min, "
-              f"max_tokens=16000")
+        print(f"[LLMService] PDF pages={pdf_page_count} → target {target_minutes} min "
+              f"(~{target_words} words), max_tokens={self._dynamic_max_tokens}")
 
-        # Send full PDF text — no slicing, no content loss
         prompt = f"""
 {self._style_guide()}
 
-{self._transcript_task(target_exchanges=target_exchanges)}
+{self._transcript_task(target_words=target_words, target_minutes=target_minutes)}
 
 --- SIMPLIFIED PDF CONTENT START ---
 {simplified_text}
 --- SIMPLIFIED PDF CONTENT END ---
 
-Write the COMPLETE script now covering EVERY section in the PDF above.
-Do not stop until all PDF content is covered and you reach the Yaad Rakho section.
+Write the script now, staying within the word budget above.
 """
         if self._anthropic_key:
             try:
@@ -330,9 +399,15 @@ Do not stop until all PDF content is covered and you reach the Yaad Rakho sectio
         else:
             result = self._generate_transcript_openai(prompt)
 
-        word_count = len(result.split())
-        print(f"[LLMService] ✅ Final transcript: {word_count} words "
-              f"({word_count//130:.0f}-{word_count//110:.0f} min estimated)")
+        pre_words = len(result.split())
+        result = truncate_transcript_to_word_budget(result, max_words_hard_cap)
+        post_words = len(result.split())
+        if post_words < pre_words:
+            print(f"[LLMService] ✂️  Truncated {pre_words} → {post_words} words "
+                  f"(cap {max_words_hard_cap} for {target_minutes} min target)")
+
+        print(f"[LLMService] ✅ Final transcript: {post_words} words "
+              f"(~{post_words / _WORDS_PER_MINUTE:.1f} min estimated)")
         return result
 
     # ------------------------------------------------------------------
@@ -363,10 +438,14 @@ Do not stop until all PDF content is covered and you reach the Yaad Rakho sectio
             if sec.get("example"):
                 sections_detail += f"  Example: {sec['example']}\n"
 
+        target_minutes = 13
+        target_words   = target_minutes * _WORDS_PER_MINUTE
+        self._dynamic_max_tokens = max(2500, min(6000, int(target_words * 2.2)))
+
         prompt = f"""
 {self._style_guide()}
 
-{self._transcript_task()}
+{self._transcript_task(target_words=target_words, target_minutes=target_minutes)}
 
 Topic Summary:
 {content_summary}
@@ -377,12 +456,16 @@ Detailed Content to Cover:
         if self._anthropic_key:
             try:
                 result = self._call_claude_haiku(prompt)
+                result = truncate_transcript_to_word_budget(
+                    result, int(target_words * _TARGET_BUFFER)
+                )
                 print("[LLMService] ✅ Transcript (legacy) generated via Claude Haiku")
                 return result
             except Exception as e:
                 print(f"[LLMService] ⚠️  Claude Haiku failed: {e} — falling back")
 
-        return self._generate_transcript_openai(prompt)
+        result = self._generate_transcript_openai(prompt)
+        return truncate_transcript_to_word_budget(result, int(target_words * _TARGET_BUFFER))
 
     # ------------------------------------------------------------------
     # Internal: Claude Haiku via Anthropic REST API
@@ -392,31 +475,22 @@ Detailed Content to Cover:
         """
         Call Claude via Anthropic REST API using STREAMING to avoid timeouts.
 
-        Why streaming:
-          - A 12-15 min transcript is ~2000-2500 words / 16000 tokens.
-          - Non-streaming: httpx waits for the FULL response before returning.
-            At ~60 tokens/sec that is 250+ seconds — well past any 120s timeout.
-          - Streaming: the HTTP connection stays alive and receives chunks as they
-            arrive, so no read-timeout is triggered mid-generation.
-
-        Timeout config:
-          - connect: 15s (fail fast if Anthropic is unreachable)
-          - read:    600s (10 min — enough for the longest possible script)
-          - write:   30s  (sending the request payload)
-          - pool:    600s (match read)
+        Read timeout is now 240s (was 600s) — with the shorter, word-budgeted
+        scripts (target ≤18 min ≈ ≤2160 words ≈ ~3000-4000 tokens), generation
+        finishes well inside that window even at conservative tokens/sec, so
+        this no longer needs to hold the connection open for 10 minutes.
         """
         headers = {
             "x-api-key":         self._anthropic_key,
             "anthropic-version": "2023-06-01",
             "Content-Type":      "application/json",
         }
-        # Use dynamic token limit if set by generate_video_transcript_from_text
         max_tok = getattr(self, "_dynamic_max_tokens", 4000)
 
         payload = {
             "model":      _CLAUDE_HAIKU_MODEL,
             "max_tokens": max_tok,
-            "stream":     True,        # ← streaming keeps connection alive
+            "stream":     True,
             "messages": [
                 {"role": "user", "content": prompt}
             ],
@@ -424,9 +498,9 @@ Detailed Content to Cover:
 
         timeout = httpx.Timeout(
             connect=15.0,
-            read=600.0,    # 10 min read window — covers even the longest script
+            read=240.0,
             write=30.0,
-            pool=600.0,
+            pool=240.0,
         )
 
         collected_text = []
@@ -456,9 +530,6 @@ Detailed Content to Cover:
                         except Exception:
                             continue
 
-                        # Anthropic streaming event types:
-                        #   content_block_delta  → has delta.text
-                        #   message_stop         → generation complete
                         etype = event.get("type", "")
                         if etype == "content_block_delta":
                             delta = event.get("delta", {})
@@ -473,7 +544,6 @@ Detailed Content to Cover:
                             )
 
         except httpx.ReadTimeout:
-            # If we already collected substantial text, return what we have
             if len("".join(collected_text)) > 500:
                 print("[LLMService] ⚠️  Stream read timeout — returning partial transcript")
             else:
@@ -488,13 +558,7 @@ Detailed Content to Cover:
 
         word_count = len(result.split())
         print(f"[LLMService] ✅ Claude transcript: {word_count} words via streaming")
-
-        # Safety net: if Claude still over-generated, truncate to 35 A/B exchanges max
-        result = _truncate_transcript(result, max_exchanges=35)
-        final_words = len(result.split())
-        print(f"[LLMService] ✅ After truncation: {final_words} words")
         return result
-
 
     # ------------------------------------------------------------------
     # Internal: OpenAI transcript fallback
@@ -502,6 +566,7 @@ Detailed Content to Cover:
 
     def _generate_transcript_openai(self, prompt: str) -> str:
         try:
+            max_tok = getattr(self, "_dynamic_max_tokens", 3500)
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -511,13 +576,13 @@ Detailed Content to Cover:
                             f"You are a {self.cfg.full_name} educational script writer. "
                             f"You write engaging, content-dense, and accurate scripts "
                             f"that {self.cfg.full_name} students can easily understand. "
-                            "Always write a complete 7-15 minute script."
+                            "Stay within the requested word budget."
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.85,
-                max_tokens=4000,
+                max_tokens=max_tok,
             )
             return response.choices[0].message.content
         except Exception as e:
