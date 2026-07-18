@@ -56,6 +56,38 @@ Other efficiency changes:
   - Rendered PDF pages are cached with a small bounded LRU (default 6
     pages) instead of an unbounded per-segment dict, so long videos that
     revisit earlier pages don't slowly leak memory.
+
+PAGE-COVERAGE FIX (2026-07, follow-up)
+---------------------------------------
+Two bugs were causing 20-30% of PDF pages to be silently dropped from
+generated videos:
+
+  1. `_is_toc_page` used an UNANCHORED keyword search across the entire
+     page body (`table of contents|contents|index|sr\.?\s*no|...`) and
+     returned True on ANY match, anywhere in the page. On dense CA/CS
+     content this fired constantly on completely normal content pages:
+       - "Sr. No." is the most common table-column header in Indian
+         accounting worksheets (journals, ledgers, depreciation
+         schedules) — it is NOT a TOC signal.
+       - "index" matches "cost inflation index", "price index", etc.
+       - "contents" matches "contents of an invoice", "contents of the
+         trial balance", etc.
+     Any of these mid-page hits caused `_get_pdf_page` to silently swap
+     in a DIFFERENT page (scanning forward up to 4 pages), so real
+     content pages never made it into the video at all.
+
+     FIX: the keyword check is now anchored to short heading-like lines
+     near the TOP of the page only (first 3 non-empty lines, page not
+     too long) — a true TOC/index page's title line, not a keyword
+     appearing anywhere in body text. "sr. no" was removed from the
+     keyword list entirely since it's a table-header signal, not a TOC
+     signal; the existing structural dot-line/short-line heuristic
+     already catches genuine TOC pages without it.
+
+  2. There was no visibility into when a page got swapped, making this
+     silent-loss bug hard to catch. `_get_pdf_page` now logs whenever the
+     resolved page differs from the requested page, so any remaining
+     false positives are visible in logs instead of invisible.
 """
 
 from moviepy.editor import AudioFileClip, VideoClip, concatenate_videoclips
@@ -231,10 +263,25 @@ def _render_pdf_page(pdf_path: str, page_num: int,
         return None
 
 
-# TOC / cover page detection ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# TOC / cover page detection
+# ---------------------------------------------------------------------------
+# FIXED (2026-07): previously this matched keywords ANYWHERE in the page
+# body ("Sr. No.", "index", "contents") which falsely flagged huge numbers
+# of normal content pages (accounting tables almost always have a "Sr. No."
+# column; "cost inflation index" / "contents of an invoice" etc. are
+# completely ordinary phrases). That caused _get_pdf_page to silently swap
+# in a different page and drop real content from the video.
+#
+# Now: the keyword check only fires when the match is one of the first few
+# lines of the page AND reads like a standalone heading (short, on its own
+# line) — the way an actual "Table of Contents" or "Index" page title would
+# appear. "sr. no" / "sr no" was removed entirely; it is a table-column
+# header, not a TOC signal. The structural dot-line/short-line heuristic
+# below (unchanged) is what actually catches genuine TOC/index pages.
 _TOC_KEYWORDS = re.compile(
-    r'(table\s+of\s+contents|contents|index|sr\.?\s*no|chapter\s+list'
-    r'|विषय\s*सूची|अनुक्रमणिका)',
+    r'^\s*(table\s+of\s+contents|contents|index|chapter\s+list'
+    r'|विषय\s*सूची|अनुक्रमणिका)\s*$',
     re.IGNORECASE,
 )
 
@@ -243,7 +290,15 @@ _TOC_KEYWORDS = re.compile(
 def _is_toc_page(pdf_path: str, page_num: int) -> bool:
     """
     Return True if the page looks like a Table of Contents, index, or cover.
-    Checks: keyword match in text + high ratio of short lines (TOC structure).
+
+    Two independent checks, EITHER of which can flag a page:
+      1. Heading check: one of the first 3 non-empty lines matches a TOC/
+         index heading pattern AND the page is short (<60 lines total) —
+         i.e. it reads like a genuine TOC page's title, not a keyword
+         appearing incidentally deep in a content page.
+      2. Structural check: TOC pages have many short lines with dot-leaders
+         or trailing page numbers (e.g. "Chapter 3 ..... 42").
+
     Cached (per pdf_path/page_num) since this is called repeatedly while
     scanning forward for the next non-TOC page.
     """
@@ -259,14 +314,21 @@ def _is_toc_page(pdf_path: str, page_num: int) -> bool:
         if not text.strip():       # blank / image-only page
             return False
 
-        # Keyword check
-        if _TOC_KEYWORDS.search(text):
-            return True
-
-        # Structural check: TOC pages have many short lines with dots/numbers
-        lines       = [l.strip() for l in text.splitlines() if l.strip()]
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
         if not lines:
             return False
+
+        # ── Check 1: anchored heading match ────────────────────────────
+        # Only look at the first few lines, and only trust it on pages
+        # that are short enough to plausibly BE a TOC/index (a genuine TOC
+        # page is short; a 2-page dense content page discussing "the index
+        # number" is not going to look like this).
+        if len(lines) < 60:
+            for line in lines[:3]:
+                if _TOC_KEYWORDS.match(line):
+                    return True
+
+        # ── Check 2: structural check (unchanged) ──────────────────────
         dot_lines   = sum(1 for l in lines if re.search(r'\.{3,}|\s{3,}\d+\s*$', l))
         short_lines = sum(1 for l in lines if len(l) < 60)
         toc_score   = (dot_lines / len(lines)) + (short_lines / len(lines))
@@ -422,6 +484,15 @@ class VideoService:
         total_len_min = (self._page_timeline[-1]["t_end"] / 60) if self._page_timeline else 0
         print(f"[VideoService] Timeline rebuilt: {len(self._page_timeline)} page blocks, "
               f"total {total_len_min:.1f} min")
+
+        # Coverage sanity check — log (don't fail) if pages referenced in the
+        # transcript don't span the full PDF, so gaps are visible in logs.
+        if self._pdf_pages > 0 and self._page_timeline:
+            referenced_pages = {block["page"] for block in self._page_timeline}
+            missing = sorted(set(range(1, self._pdf_pages + 1)) - referenced_pages)
+            if missing:
+                print(f"[VideoService] ⚠️  Transcript does not reference "
+                      f"{len(missing)}/{self._pdf_pages} PDF page(s): {missing}")
 
         clips    = []
         global_t = 0.0
@@ -780,6 +851,11 @@ class VideoService:
         Cache is a bounded LRU (PDF_CACHE_MAX_PAGES). This keeps memory flat
         even for very long videos that jump between many pages, instead of
         an unbounded dict that only ever grows.
+
+        NOTE (2026-07 fix): resolution is now logged whenever the page that
+        actually gets rendered differs from the page that was requested, so
+        any TOC-detector false positive (or genuine skip) is visible in
+        logs instead of silently dropping content from the video.
         """
         if not self._pdf_path or page_number < 1:
             return None
@@ -790,6 +866,10 @@ class VideoService:
             if not _is_toc_page(self._pdf_path, candidate):
                 resolved = candidate
                 break
+
+        if resolved != page_number:
+            print(f"[VideoService] ⚠️  Page {page_number} flagged as TOC-like — "
+                  f"using page {resolved} instead")
 
         if resolved in self._pdf_cache:
             self._pdf_cache.move_to_end(resolved)   # mark as recently used
